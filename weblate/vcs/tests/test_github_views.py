@@ -744,6 +744,30 @@ class GitHubInstallationViewTest(ViewTestCase):
         )
 
     @responses.activate
+    def test_setup_rejects_malformed_installation_id(self):
+        install_url = self._start_install("/create/component/#github")
+        state = parse_qs(urlparse(install_url).query)["state"][0]
+
+        response = self.client.get(
+            reverse("github-app-setup"),
+            {
+                "installation_id": "12345/access_tokens",
+                "state": state,
+                "code": "oauth-code",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(GitHubInstallation.objects.exists())
+        self.assertEqual(len(responses.calls), 0)
+        response_messages = [
+            str(message) for message in get_messages(response.wsgi_request)
+        ]
+        self.assertEqual(
+            response_messages, ["GitHub did not return a valid installation ID."]
+        )
+
+    @responses.activate
     def test_setup_rejects_foreign_installation_id(self):
         # The attacker holds a valid signed state for their own workspace and a
         # valid OAuth code for *their* GitHub account, then swaps in another
@@ -1381,21 +1405,75 @@ class GitHubAppManifestViewTest(TestCase):
         user.clear_cache()
 
     def _post_register(self, **fields):
-        return self.client.post(reverse("github-app-register-submit"), fields)
+        data = {"host": "github.com", "name": "Test Weblate", "public": "1"}
+        data.update(fields)
+        return self.client.post(reverse("github-app-register-submit"), data)
 
-    def _action_url(self) -> str:
-        return self.client.session["github_app_register_action_url"]
+    def _action_url(self, response) -> str:
+        return response.context["action_url"]
 
     def _capture_github_call(self, **fields) -> tuple[str, dict]:
         submit = self._post_register(**fields)
         self.assertEqual(submit.status_code, 200)
         manifest_json = submit.context["manifest_json"]
-        redirect = self.client.post(
-            reverse("github-app-register-redirect"),
-            {"manifest": manifest_json},
+        return self._action_url(submit), json.loads(manifest_json)
+
+    def _get_form_action_csp(self, response) -> str:
+        for directive in response["Content-Security-Policy"].split(";"):
+            directive = directive.strip()
+            if directive.startswith("form-action "):
+                return directive
+        msg = "Missing form-action directive"
+        raise AssertionError(msg)
+
+    def test_register_submit_posts_directly_to_github_with_csp(self):
+        for host in ("github.com", "github.example.com", "github"):
+            with self.subTest(host=host):
+                response = self._post_register(host=host)
+                self.assertEqual(response.status_code, 200)
+                action_url = self._action_url(response)
+
+                parsed = urlparse(action_url)
+                self.assertEqual(parsed.netloc, host)
+                self.assertEqual(parsed.path, "/settings/apps/new")
+
+                form_action_csp = self._get_form_action_csp(response)
+                self.assertIn("'self'", form_action_csp)
+                self.assertIn(f"https://{host}", form_action_csp)
+                self.assertContains(
+                    response, f'<form method="post" action="{action_url}">'
+                )
+                content = response.content.decode()
+                form_start = content.index(
+                    f'<form method="post" action="{action_url}">'
+                )
+                form_end = content.index("</form>", form_start)
+                self.assertNotIn("csrfmiddlewaretoken", content[form_start:form_end])
+
+    def test_register_submit_rejects_invalid_host(self):
+        for host in (
+            "github.com; script-src *",
+            "github.com@attacker.example",
+            "github.com:8443",
+            "https://github.com",
+            "github.com/path",
+            "github.com?query=1",
+        ):
+            with self.subTest(host=host):
+                response = self._post_register(host=host)
+
+                self.assertRedirects(response, reverse("github-app-register"))
+                self.assertNotIn("github_app_register_nonce", self.client.session)
+
+    def test_register_rejects_prefilled_invalid_host(self):
+        response = self.client.get(
+            reverse("github-app-register"),
+            {"host": "github.com@attacker.example"},
         )
-        self.assertEqual(redirect.status_code, 307)
-        return redirect["Location"], json.loads(manifest_json)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["hostname"], "github.com")
+        self.assertNotContains(response, "attacker.example")
 
     def test_register_post_sends_expected_manifest_to_github(self):
         url, manifest = self._capture_github_call(
@@ -1463,8 +1541,8 @@ class GitHubAppManifestViewTest(TestCase):
             json=MANIFEST_RESPONSE,
         )
         # Prime the session state via a POST to the register view
-        self._post_register(host="github.com")
-        state = parse_qs(urlparse(self._action_url()).query)["state"][0]
+        submit = self._post_register(host="github.com")
+        state = parse_qs(urlparse(self._action_url(submit)).query)["state"][0]
 
         response = self.client.get(
             reverse("github-app-register-callback"),
@@ -1486,14 +1564,41 @@ class GitHubAppManifestViewTest(TestCase):
         self.assertIn("manifest", credentials.private_key)
 
     @responses.activate
+    def test_register_callback_quotes_code_path_segment(self):
+        responses.add(
+            responses.POST,
+            "https://api.github.com/app-manifests/"
+            "..%2Finstallations%2F123%2Faccess_tokens/conversions",
+            json=MANIFEST_RESPONSE,
+        )
+        submit = self._post_register(host="github.com")
+        state = parse_qs(urlparse(self._action_url(submit)).query)["state"][0]
+
+        response = self.client.get(
+            reverse("github-app-register-callback"),
+            {
+                "code": "../installations/123/access_tokens",
+                "state": state,
+            },
+        )
+
+        self.assertRedirects(response, reverse("manage-github-accounts"))
+        self.assertTrue(GitHubAppCredentials.objects.exists())
+        self.assertEqual(
+            responses.calls[0].request.url,
+            "https://api.github.com/app-manifests/"
+            "..%2Finstallations%2F123%2Faccess_tokens/conversions",
+        )
+
+    @responses.activate
     def test_register_callback_updates_existing(self):
         responses.add(
             responses.POST,
             "https://api.github.com/app-manifests/tempcode123/conversions",
             json=MANIFEST_RESPONSE,
         )
-        self._post_register(host="github.com")
-        state = parse_qs(urlparse(self._action_url()).query)["state"][0]
+        submit = self._post_register(host="github.com")
+        state = parse_qs(urlparse(self._action_url(submit)).query)["state"][0]
         # Simulate a concurrent row appearing between submit and callback -
         # the callback should still upsert rather than crash.
         GitHubAppCredentials.objects.create(
@@ -1533,8 +1638,8 @@ class GitHubAppManifestViewTest(TestCase):
             "https://api.github.com/app-manifests/x/conversions",
             json={"id": 99},  # missing pem/slug/secret
         )
-        self._post_register(host="github.com")
-        state = parse_qs(urlparse(self._action_url()).query)["state"][0]
+        submit = self._post_register(host="github.com")
+        state = parse_qs(urlparse(self._action_url(submit)).query)["state"][0]
 
         response = self.client.get(
             reverse("github-app-register-callback"),
@@ -1556,7 +1661,6 @@ class GitHubAppManifestViewTest(TestCase):
         protected_urls: tuple[tuple[str, str, dict[str, str]], ...] = (
             ("get", reverse("github-app-register"), {}),
             ("post", reverse("github-app-register-submit"), {}),
-            ("post", reverse("github-app-register-redirect"), {}),
             ("get", reverse("github-app-register-callback"), {}),
         )
         for method, url, data in protected_urls:
@@ -1617,13 +1721,16 @@ class GitHubAppManifestViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.context["host_already_registered"])
         self.assertEqual(response.context["existing_hosts"], ["github.com"])
-        self.assertContains(response, "already registered")
-        # Submit button disabled when host conflicts
-        self.assertContains(response, "disabled")
+        self.assertContains(response, "already has stored GitHub App credentials")
+        content = response.content.decode()
+        button_start = content.index('type="submit"')
+        button_end = content.index("</button>", button_start)
+        self.assertNotIn("disabled", content[button_start:button_end])
 
         response = self._post_register(host="github.com")
-        self.assertRedirects(response, reverse("manage-github-accounts"))
-        self.assertNotIn("github_app_register_action_url", self.client.session)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "already registered for github.com")
+        self.assertNotIn("github_app_register_nonce", self.client.session)
 
         url, _manifest = self._capture_github_call(host="github.example.com")
 

@@ -6276,6 +6276,53 @@ class GitSquashAddonTest(ViewTestCase):
     def test_squash_sitewide(self) -> None:
         self.test_squash(sitewide=True)
 
+    def test_squash_skips_interrupted_repository_operation(self) -> None:
+        addon = self.create("all")
+        repository = self.component.repository
+
+        with (
+            patch.object(
+                repository,
+                "ensure_no_interrupted_operation",
+                side_effect=RepositoryError(
+                    1, "Repository has an interrupted Git rebase operation."
+                ),
+            ),
+            self.assertRaises(RepositoryError),
+        ):
+            addon.post_commit(self.component, True)
+
+        alert = self.component.alert_set.get(name="RepositoryOperationFailure")
+        self.assertIn("interrupted Git rebase operation", alert.details["error"])
+
+    def test_author_squash_stops_on_interrupted_repository_operation(self) -> None:
+        addon = self.create("author")
+        repository = self.component.repository
+        error = RepositoryError(
+            1, "Repository has an interrupted Git cherry-pick operation."
+        )
+
+        with (
+            patch.object(
+                repository, "get_remote_branch_name", return_value="origin/main"
+            ),
+            patch.object(repository, "execute", return_value="") as execute,
+            patch.object(repository, "get_gpg_sign_args", return_value=[]),
+            patch.object(repository, "delete_branch"),
+            patch.object(
+                repository, "get_interrupted_operation", return_value="cherry-pick"
+            ),
+            patch.object(addon, "squash_author_commits", side_effect=error),
+            self.assertRaises(RepositoryError) as context,
+        ):
+            addon.squash_author(self.component, repository)
+
+        self.assertIs(context.exception, error)
+        execute.assert_called_once_with(
+            ["log", "--no-merges", "--format=%H %aE", "origin/main..HEAD"],
+            remote_op="none",
+        )
+
     def test_languages(self) -> None:
         self.test_squash("language", 2)
 
@@ -8501,6 +8548,52 @@ class SlackWebhooksAddonsTest(BaseWebhookTests, ViewTestCase):
     def test_invalid_response(self) -> None:
         """Test invalid response from client."""
         self.do_translation_added_test(response_code=410, body=b"channel_is_archived")
+
+
+class FedoraMessagingPEMBlockTest(SimpleTestCase):
+    @staticmethod
+    def get_certificate() -> str:
+        return Path("weblate/trans/tests/data/saml.crt").read_text(encoding="utf-8")
+
+    @staticmethod
+    def get_private_key() -> str:
+        return Path("weblate/trans/tests/data/saml.key").read_text(encoding="utf-8")
+
+    def test_pem_block_labels_accept_multiple_blocks(self) -> None:
+        cert = self.get_certificate()
+
+        labels = FedoraMessagingAddon._get_pem_block_labels(  # noqa: SLF001
+            f"{cert}\n{cert}"
+        )
+
+        self.assertEqual(labels, ["CERTIFICATE", "CERTIFICATE"])
+
+    def test_pem_block_labels_reject_malformed_delimiter_input(self) -> None:
+        value = "-----BEGIN CERTIFICATE-----\n" + "\n".join(
+            "-----END PRIVATE KEY-----" for _ in range(100)
+        )
+
+        labels = FedoraMessagingAddon._get_pem_block_labels(value)  # noqa: SLF001
+
+        self.assertEqual(labels, [])
+
+    def test_pem_block_labels_include_blocks_after_trailing_whitespace_end(
+        self,
+    ) -> None:
+        cert = self.get_certificate()
+        key = self.get_private_key()
+        value = (
+            cert.replace("-----END CERTIFICATE-----", "-----END CERTIFICATE-----   ", 1)
+            + f"\n{key}\n{cert}"
+        )
+
+        labels = FedoraMessagingAddon._get_pem_block_labels(value)  # noqa: SLF001
+
+        self.assertEqual(labels, ["CERTIFICATE", "PRIVATE KEY", "CERTIFICATE"])
+        with self.assertRaisesMessage(ConfigurationException, "invalid certificate"):
+            FedoraMessagingAddon._validate_pem_certificates(  # noqa: SLF001
+                value, "invalid certificate"
+            )
 
 
 class FedoraMessagingAddonTestCase(BaseWebhookTests, ViewTestCase):

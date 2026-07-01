@@ -16,7 +16,7 @@ from django.core.checks import run_checks
 from django.core.exceptions import PermissionDenied
 from django.core.mail import send_mail
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Max, Q
 from django.http import Http404, HttpResponse
 from django.shortcuts import redirect, render
 from django.urls import reverse
@@ -48,6 +48,7 @@ from weblate.auth.models import (
 from weblate.configuration.models import Setting, SettingCategory
 from weblate.configuration.views import CustomCSSView
 from weblate.memory.models import Memory, MemoryScopeMigrationState
+from weblate.memory.tasks import MEMORY_SCOPE_COMPACTION_STATE
 from weblate.trans.actions import ActionEvents
 from weblate.trans.alerts.base import AlertSeverity
 from weblate.trans.forms import AnnouncementForm
@@ -385,27 +386,6 @@ def backups(request: AuthenticatedHttpRequest) -> HttpResponse:
     return render(request, "manage/backups.html", context)
 
 
-def get_memory_duplicate_group_count() -> int:
-    # TODO(2028.1): Remove this migration status helper once Weblate no longer
-    # supports direct upgrades from 2026 releases.
-    """Return translation memory duplicate group count."""
-    return (
-        Memory.objects.values(
-            "source_language_id",
-            "target_language_id",
-            "source",
-            "target",
-            "origin",
-            "context",
-            "status",
-            "legacy_from_file",
-        )
-        .annotate(count=Count("id"))
-        .filter(count__gt=1)
-        .count()
-    )
-
-
 def get_memory_migration_status() -> dict[str, Any]:
     # TODO(2028.1): Remove this migration status helper once Weblate no longer
     # supports direct upgrades from 2026 releases.
@@ -413,40 +393,71 @@ def get_memory_migration_status() -> dict[str, Any]:
     state = MemoryScopeMigrationState.objects.filter(
         name="memory-scope-backfill"
     ).first()
-    total = Memory.objects.count()
+    compaction_state = MemoryScopeMigrationState.objects.filter(
+        name=MEMORY_SCOPE_COMPACTION_STATE
+    ).first()
+    max_memory_id = Memory.objects.aggregate(max_id=Max("id"))["max_id"] or 0
     last_memory_id = state.last_memory_id if state is not None else 0
+    compaction_last_memory_id = (
+        compaction_state.last_memory_id if compaction_state is not None else 0
+    )
     needs_backfill = state is not None and not state.completed
-    if state is None and total:
+    if state is None and max_memory_id:
         needs_backfill = (
             Memory.objects.alias(memory_has_scope=Memory.objects.get_has_scope_exists())
             .filter(memory_has_scope=False)
             .exists()
         )
-    backfill_completed = total == 0 or not needs_backfill
+    backfill_completed = max_memory_id == 0 or not needs_backfill
 
     if backfill_completed:
         backfill_percent = 100
-        processed = total
+        processed = max_memory_id
     else:
-        processed = Memory.objects.filter(id__lte=last_memory_id).count()
-        backfill_percent = min(round(processed * 100 / total), 100)
+        processed = last_memory_id
+        backfill_percent = (
+            min(round(processed * 100 / max_memory_id), 100) if max_memory_id else 0
+        )
 
-    duplicate_groups = (
-        get_memory_duplicate_group_count()
-        if state is not None and state.completed
+    compaction_completed = (
+        backfill_completed
+        and compaction_state is not None
+        and compaction_state.completed
+    )
+    compaction_active = (
+        backfill_completed and max_memory_id > 0 and not compaction_completed
+    )
+    compaction_percent = (
+        min(round(compaction_last_memory_id * 100 / max_memory_id), 100)
+        if max_memory_id and compaction_active
+        else 100
+        if compaction_completed or not max_memory_id
         else 0
     )
+    duplicate_groups = 0 if compaction_completed or not max_memory_id else None
 
     return {
         "backfill_completed": backfill_completed,
         "backfill_percent": backfill_percent,
-        "completed": backfill_completed and duplicate_groups == 0,
+        "completed": backfill_completed and not compaction_active,
+        "compaction_active": compaction_active,
+        "compaction_completed": compaction_completed,
+        "compaction_last_memory_id": compaction_last_memory_id,
+        "compaction_max_memory_id": max_memory_id,
+        "compaction_percent": compaction_percent,
         "duplicate_groups": duplicate_groups,
+        "duplicate_groups_known": duplicate_groups is not None,
         "last_memory_id": last_memory_id,
         "processed": processed,
         "state": state,
-        "total": total,
-        "updated": state.updated if state is not None else None,
+        "total": max_memory_id,
+        "updated": (
+            compaction_state.updated
+            if backfill_completed and compaction_state is not None
+            else state.updated
+            if state is not None
+            else None
+        ),
     }
 
 

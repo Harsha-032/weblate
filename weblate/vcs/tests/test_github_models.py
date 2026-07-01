@@ -6,21 +6,23 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import cast
 from unittest.mock import patch
 
 import responses
 from django.core.cache import cache
 from django.test import TestCase
 
-from weblate.trans.models import Component
+from weblate.trans.models import Component, Project
 from weblate.vcs.base import RepositoryError
 from weblate.vcs.github import (
     GitHubAppCredentials,
     GitHubAppNotConfiguredError,
     GithubAppRepository,
     GitHubInstallation,
+    exchange_github_app_manifest_code,
+    get_installation_token,
+    normalize_github_callback_code,
+    normalize_github_installation_id,
 )
 from weblate.vcs.tests.utils import generate_private_key
 from weblate.workspaces.models import Workspace
@@ -64,22 +66,31 @@ class TestGitHubInstallationManager(TestCase):
             repositories=[{"full_name": "test-org/repo1"}]
         )
 
+    def _make_component(
+        self,
+        repo: str = "https://github.com/test-org/repo1.git",
+        *,
+        has_workspace: bool = True,
+        push: str = "",
+    ) -> Component:
+        project = Project(
+            id=1,
+            name="Test",
+            slug="test",
+            workspace=self.installation.workspace if has_workspace else None,
+        )
+        return Component(
+            name="Component",
+            slug="component",
+            project=project,
+            repo=repo,
+            push=push,
+        )
+
     def _make_app_repository(
         self, repo: str = "https://github.com/test-org/repo1.git"
     ) -> GithubAppRepository:
-        component = cast(
-            "Component",
-            SimpleNamespace(
-                pk=None,
-                full_slug="test/project/component",
-                project_id=1,
-                project=SimpleNamespace(
-                    workspace_id=self.installation.workspace_id,
-                    workspace=self.installation.workspace,
-                ),
-                repo=repo,
-            ),
-        )
+        component = self._make_component(repo)
         return GithubAppRepository(".", branch="main", component=component, local=True)
 
     def test_get_for_repo(self):
@@ -135,6 +146,74 @@ class TestGitHubInstallationManager(TestCase):
             GitHubInstallation.objects.get_for_installation("github.com", "67890"),
             self.installation,
         )
+
+    def test_normalize_installation_id(self):
+        self.assertEqual(normalize_github_installation_id(67890), "67890")
+        self.assertEqual(normalize_github_installation_id(" 0067890 "), "67890")
+        self.assertEqual(
+            normalize_github_installation_id("\uff16\uff17\uff18\uff19\uff10"),
+            "67890",
+        )
+
+        for installation_id in (
+            "",
+            "0",
+            "67890/access_tokens",
+            "../67890",
+        ):
+            with (
+                self.subTest(installation_id=installation_id),
+                self.assertRaises(ValueError),
+            ):
+                normalize_github_installation_id(installation_id)
+
+        with self.assertRaises(TypeError):
+            normalize_github_installation_id(True)
+
+    def test_normalize_callback_code(self):
+        self.assertEqual(
+            normalize_github_callback_code(" temp.code-123_abc "),
+            "temp.code-123_abc",
+        )
+        self.assertEqual(
+            normalize_github_callback_code(" t\u00e9mpcode/with/slash?x=1 "),
+            "t\u00e9mpcode/with/slash?x=1",
+        )
+
+        for code in (
+            "",
+            ".",
+            "..",
+        ):
+            with self.subTest(code=code), self.assertRaises(ValueError):
+                normalize_github_callback_code(code)
+
+    @responses.activate
+    def test_installation_token_rejects_malformed_installation_id(self):
+        with self.assertRaises(ValueError):
+            get_installation_token(
+                "99999",
+                SETTINGS_PRIVATE_KEY,
+                "67890/access_tokens",
+                "github.com",
+            )
+
+        self.assertEqual(len(responses.calls), 0)
+
+    @responses.activate
+    def test_manifest_code_quotes_code_path_segment(self):
+        responses.add(
+            responses.POST,
+            "https://api.github.com/app-manifests/"
+            "..%2Finstallations%2F67890%2Faccess_tokens%3Fx%3D1/conversions",
+            json={"id": 99},
+        )
+
+        exchange_github_app_manifest_code(
+            "../installations/67890/access_tokens?x=1", "github.com"
+        )
+
+        self.assertEqual(len(responses.calls), 1)
 
     @responses.activate
     def test_sync_from_api(self):
@@ -281,17 +360,26 @@ class TestGitHubInstallationManager(TestCase):
         self.assertEqual(len(responses.calls), 1)
 
     @responses.activate
+    def test_github_repository_auth_args_malformed_installation_id_raises_repository_error(
+        self,
+    ):
+        _make_credentials()
+        self.installation.installation_id = "67890/access_tokens"
+        self.installation.save(update_fields=["installation_id"])
+        repository = self._make_app_repository()
+
+        with self.assertRaisesRegex(
+            RepositoryError, "Invalid GitHub App installation ID"
+        ):
+            list(
+                repository._get_auth_args("https://github.com/test-org/repo1.git")  # noqa: SLF001
+            )
+
+        self.assertEqual(len(responses.calls), 0)
+
+    @responses.activate
     def test_github_repository_instance_auth_requires_workspace(self):
-        component = cast(
-            "Component",
-            SimpleNamespace(
-                pk=None,
-                full_slug="test/project/component",
-                project_id=1,
-                project=SimpleNamespace(workspace_id=None, workspace=None),
-                repo="https://github.com/test-org/repo1.git",
-            ),
-        )
+        component = self._make_component(has_workspace=False)
         repository = GithubAppRepository(
             ".", branch="main", component=component, local=True
         )
@@ -317,20 +405,7 @@ class TestGitHubInstallationManager(TestCase):
             "https://api.github.com/app/installations/67890/access_tokens",
             status=500,
         )
-        component = cast(
-            "Component",
-            SimpleNamespace(
-                pk=None,
-                full_slug="test/project/component",
-                project_id=1,
-                project=SimpleNamespace(
-                    workspace_id=self.installation.workspace_id,
-                    workspace=self.installation.workspace,
-                ),
-                repo="https://github.com/test-org/repo1.git",
-                push="",
-            ),
-        )
+        component = self._make_component()
         repository = GithubAppRepository(
             ".", branch="main", component=component, local=True
         )
@@ -351,19 +426,7 @@ class TestGitHubInstallationManager(TestCase):
             "https://api.github.com/app/installations/67890/access_tokens",
             json={"token": "ghs_test"},
         )
-        component = cast(
-            "Component",
-            SimpleNamespace(
-                pk=None,
-                full_slug="test/project/component",
-                project_id=1,
-                project=SimpleNamespace(
-                    workspace_id=self.installation.workspace_id,
-                    workspace=self.installation.workspace,
-                ),
-                repo="https://github.com/test-org/repo1.git",
-            ),
-        )
+        component = self._make_component()
         repository = GithubAppRepository(
             ".", branch="main", component=component, local=True
         )
@@ -389,19 +452,7 @@ class TestGitHubInstallationManager(TestCase):
             "https://api.github.com/app/installations/67890/access_tokens",
             json={"token": "ghs_test"},
         )
-        component = cast(
-            "Component",
-            SimpleNamespace(
-                pk=None,
-                full_slug="test/project/component",
-                project_id=1,
-                project=SimpleNamespace(
-                    workspace_id=self.installation.workspace_id,
-                    workspace=self.installation.workspace,
-                ),
-                repo="https://github.com/test-org/repo1.git",
-            ),
-        )
+        component = self._make_component()
         repository = GithubAppRepository(
             ".", branch="main", component=component, local=True
         )
@@ -433,19 +484,7 @@ class TestGitHubInstallationManager(TestCase):
             "https://api.github.com/app/installations/67890/access_tokens",
             json={"token": "ghs_test"},
         )
-        component = cast(
-            "Component",
-            SimpleNamespace(
-                pk=None,
-                full_slug="test/project/component",
-                project_id=1,
-                project=SimpleNamespace(
-                    workspace_id=self.installation.workspace_id,
-                    workspace=self.installation.workspace,
-                ),
-                repo="https://github.com/test-org/repo1.git",
-            ),
-        )
+        component = self._make_component()
         repository = GithubAppRepository(
             ".", branch="main", component=component, local=True
         )

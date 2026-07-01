@@ -172,6 +172,8 @@ from weblate.utils.validators import (
 )
 from weblate.vcs.base import (
     RepositoryError,
+    RepositoryRecoveryEvent,
+    RepositoryRestrictedPathError,
     RepositorySymlinkError,
     is_ssh_host_key_mismatch_error,
     is_ssh_host_key_verification_error,
@@ -209,7 +211,13 @@ MERGE_CHOICES = (
     ("merge_noff", gettext_lazy("Merge without fast-forward")),
 )
 
-LOCKING_ALERTS = {"MergeFailure", "UpdateFailure", "PushFailure", "ParseError"}
+LOCKING_ALERTS = {
+    "MergeFailure",
+    "UpdateFailure",
+    "PushFailure",
+    "ParseError",
+    "RepositoryOperationFailure",
+}
 
 BITBUCKET_GIT_REPOS_REGEXP = [
     r"(?:ssh|https):\/\/(?:(?:git@|)bitbucket.org)\/([^/]*)\/([^/]*)",
@@ -2935,6 +2943,7 @@ class Component(  # ruff: ignore[too-many-public-methods]
             self.delete_alert("MergeFailure")
             self.delete_alert("RepositoryOutdated")
             self.delete_alert("PushFailure")
+            self.delete_alert("RepositoryOperationFailure")
 
             if keep_changes and not self.restore_pending_translation_files(
                 request=request, user=user
@@ -2967,9 +2976,10 @@ class Component(  # ruff: ignore[too-many-public-methods]
 
         user = request.user if request else self.acting_user
         try:
-            previous_head = self.reset_repository_to_remote(
-                request, user, keep_changes=keep_changes
-            )
+            with self.repository.lock.without_recovery():
+                previous_head = self.reset_repository_to_remote(
+                    request, user, keep_changes=keep_changes
+                )
         except RepositoryError:
             report_error(
                 "Could not reset the repository",
@@ -3699,6 +3709,33 @@ class Component(  # ruff: ignore[too-many-public-methods]
 
     def get_local_head_revision(self) -> str:
         return self.repository.last_revision
+
+    def handle_repository_recovery(
+        self, recovery_events: list[RepositoryRecoveryEvent]
+    ) -> None:
+        """Record automatic recovery from interrupted repository operations."""
+        if self._state.adding:
+            return
+        for event in recovery_events:
+            self.change_set.create(
+                action=ActionEvents.REPO_CLEANUP,
+                details={
+                    "recovery": True,
+                    "operation": event.operation,
+                    **event.details,
+                },
+            )
+        self.delete_alert("RepositoryOperationFailure")
+
+    def handle_repository_recovery_failure(self, error: Exception) -> None:
+        """Surface failed recovery from interrupted repository operations."""
+        if self._state.adding:
+            return
+        if isinstance(error, RepositoryError):
+            error_text = self.error_text(error)
+        else:
+            error_text = str(error)
+        self.add_alert("RepositoryOperationFailure", error=error_text)
 
     @perform_on_link
     @contextmanager
@@ -6350,6 +6387,10 @@ class Component(  # ruff: ignore[too-many-public-methods]
         # This might throw an exception in case of invalid link
         try:
             self.repository.resolve_symlinks(filename)
+        except RepositoryRestrictedPathError as error:
+            raise ValidationError(
+                gettext("File path is in a restricted location in the repository.")
+            ) from error
         except RepositorySymlinkError as error:
             raise ValidationError(
                 gettext("Invalid symbolic link in a repository.")
